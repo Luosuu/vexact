@@ -24,10 +24,38 @@ for a fixed K order (tests/batch_invariant_ops/test_moe_group_gemm_tuning.py). T
 rollout therefore stay aligned whichever side applies it. Only the forward call pattern
 (``transpose_b=True``, no activation, no accumulation, bf16, contiguous) is retuned; every other
 call goes to VeOmni's original function unchanged.
+
+Above ``_OGS_MIN_ROWS`` routed rows (prefill and mixed steps) the GEMM instead runs triton_kernels'
+ragged ``matmul_ogs`` (persistent, TMA, warp-specialized), which reaches ~400-530 TFLOP/s where
+VeOmni's kernel stays near 200. It is used with no gather/scatter/activation fusion and with split-K
+pinned to 1 (its default split-K depends on the batch and would change the reduction tree), so it too
+accumulates K sequentially from zero and returns the same bits (same test).
 """
 
 import torch
 import triton
+
+
+# Routed rows (tokens x top-k) above which matmul_ogs is used. Below it both kernels stream expert
+# weights at the same rate; above it matmul_ogs is 1.2-2.6x faster on H100.
+_OGS_MIN_ROWS = 2048
+
+
+def _load_matmul_ogs():
+    """Return a callable (a, w_ekn, splits) -> out using triton_kernels' ragged matmul_ogs."""
+    from triton_kernels.matmul_ogs import RoutingData, matmul_ogs
+    from triton_kernels.matmul_ogs_details.opt_flags import update_opt_flags_constraints
+    from triton_kernels.tensor import make_ragged_tensor_metadata
+
+    # Batch-dependent split-K would change the reduction tree; keep one CTA per output tile.
+    update_opt_flags_constraints({"split_k": 1})
+
+    def run(a, w_ekn, splits):
+        rows = a.shape[0]
+        routing = RoutingData(None, splits, splits.shape[0], 1, make_ragged_tensor_metadata(splits, rows))
+        return matmul_ogs(a, w_ekn, None, routing)
+
+    return run
 
 
 def _choose_config(max_m: int) -> tuple[int, int, int, int, int]:
@@ -50,6 +78,7 @@ def apply_moe_group_gemm_tuning() -> None:
         return
     original = kernel_module.group_gemm_same_nk
     jit_kernel = kernel_module.group_gemm_same_nk_kernel.fn  # below VeOmni's pretuned-config layer
+    ragged_matmul = _load_matmul_ogs()
 
     def group_gemm_same_nk(
         a,
@@ -85,6 +114,10 @@ def apply_moe_group_gemm_tuning() -> None:
                 c=c,
             )
         G, N, K = b.shape
+        if a.shape[0] == max_M and max_M > _OGS_MIN_ROWS:
+            # Per-expert row counts from VeOmni's inclusive cumsum (device-side, CUDA-graph safe).
+            splits = torch.diff(cumsum_M, prepend=cumsum_M.new_zeros(1)).to(torch.int32)
+            return ragged_matmul(a, b.transpose(1, 2), splits)  # [E, K, N] column-major view
         block_m, block_n, block_k, warps, stages = _choose_config(max_M)
         out = torch.empty((a.shape[0], N), dtype=a.dtype, device=a.device)
         with torch.cuda.device(a.device):
