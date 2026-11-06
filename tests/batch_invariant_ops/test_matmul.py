@@ -44,3 +44,26 @@ def test_mm_batch_invariance(dtype: torch.dtype, batch: int, dim: int) -> None:
         full_batch = torch.mm(a, b)[:1]
 
     assert torch.allclose(single_token, full_batch, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton persistent matmul requires CUDA")
+@pytest.mark.parametrize("n, k", [(4096, 2048), (2048, 6144), (151936, 2048)])
+@pytest.mark.parametrize("m", [1, 7, 64, 65, 129, 1000])
+def test_bf16_tile_candidates_are_bitwise_identical(monkeypatch, m: int, n: int, k: int) -> None:
+    """Tile choice must not change bits: every candidate reduces K in the same order, and rows beyond
+    M (EVEN_M=False) are masked without affecting valid rows."""
+    from vexact.batch_invariant_ops import batch_invariant_ops as bio
+
+    g = torch.Generator(device="cuda").manual_seed(m)
+    scale = torch.exp2(torch.randint(-4, 5, (m, k), device="cuda", generator=g).float())
+    a = (torch.randn(m, k, device="cuda", generator=g) * scale).to(torch.bfloat16)
+    w = (torch.randn(n, k, device="cuda", generator=g) * 0.02).to(torch.bfloat16)
+    bias = (torch.randn(n, device="cuda", generator=g) * 0.1).to(torch.bfloat16)
+
+    outs = []
+    for cand in bio._BF16_MATMUL_CANDIDATES:
+        monkeypatch.setattr(bio, "_bf16_matmul_config", lambda *_, c=cand: bio._as_cfg(c))
+        outs.append((bio.matmul_persistent(a, w.t()), bio.matmul_persistent(a, w.t(), bias)))
+    for plain, biased in outs[1:]:
+        assert torch.equal(plain.view(torch.int16), outs[0][0].view(torch.int16))
+        assert torch.equal(biased.view(torch.int16), outs[0][1].view(torch.int16))
